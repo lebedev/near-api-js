@@ -6,10 +6,12 @@ import { Account, SignAndSendTransactionOptions } from './account';
 import { Connection } from './connection';
 import { parseNearAmount } from './utils/format';
 import { PublicKey } from './utils/key_pair';
-import { Action, addKey, deleteKey, deployContract, functionCall, functionCallAccessKey } from './transaction';
+import { Action, addKey, deleteKey, deployContract, fullAccessKey, functionCall, functionCallAccessKey, signTransaction } from './transaction';
 import { FinalExecutionOutcome, TypedError } from './providers';
 import { fetchJson } from './utils/web';
-import { FunctionCallPermissionView } from './providers/provider';
+import { AccessKeyView, FunctionCallPermissionView } from './providers/provider';
+import { KeyPair } from './utils/key_pair';
+import { baseDecode } from 'borsh';
 
 export const MULTISIG_STORAGE_KEY = '__multisigRequest';
 export const MULTISIG_ALLOWANCE = new BN(parseNearAmount('1'));
@@ -291,18 +293,34 @@ export class Account2FA extends AccountMultisig {
         }
     }
 
-    async disable(contractBytes: Uint8Array, cleanupContractBytes: Uint8Array) {
-        const { accountId } = this;
-        const accessKeys = await this.getAccessKeys();
-        const lak2fak = accessKeys
-            .filter(({ access_key }) => access_key.permission !== 'FullAccess')
-            .filter(({ access_key }) => {
-                const perm = (access_key.permission as FunctionCallPermissionView).FunctionCall;
-                return  perm.receiver_id === accountId &&
-                    perm.method_names.length === 4 &&
-                    perm.method_names.includes('add_request_and_confirm');
-            });
-        const confirmOnlyKey = PublicKey.from((await this.postSignedJson('/2fa/getAccessKey', { accountId })).publicKey);
+    async disableWithFAK({ contractBytes, cleanupContractBytes }: { fullAccessKey: KeyPair, contractBytes: Uint8Array, cleanupContractBytes?: Uint8Array }) {
+        const publicKey = await this.connection.signer.getPublicKey(this.accountId, this.connection.networkId);
+        const accessKey = await this.connection.provider.query<AccessKeyView>({
+            request_type: 'view_access_key',
+            account_id: this.accountId,
+            public_key: publicKey.toString(),
+            finality: 'optimistic'
+        });
+        const block = await this.connection.provider.block({ finality: 'final' });
+        const blockHash = block.header.hash;
+
+        if(accessKey.permission !== 'FullAccess') {
+            throw new TypedError(`No full access key found in keystore. Unable to bypass multisig`, 'NoFAKFound');
+        }
+
+        const nonce = ++accessKey.nonce;
+        const actions = [
+            ...(cleanupContractBytes ? await this.get2faDisableCleanupActions(cleanupContractBytes) : []),
+            ...(await this.get2faDisableKeyConversionActions()),
+            deployContract(contractBytes),
+        ]
+        const [, signedTx] = await signTransaction(
+            this.accountId, nonce, actions, baseDecode(blockHash), this.connection.signer, this.accountId, this.connection.networkId
+        );
+        return this.connection.provider.sendTransaction(signedTx)
+    }
+
+    async get2faDisableCleanupActions(cleanupContractBytes: Uint8Array) {
         await this.deleteAllRequests().catch(e => {
             if(new RegExp(MultisigDeleteRequestRejectionError.REQUEST_COOLDOWN_ERROR).test(e?.kind?.ExecutionError)) {
                 return e;
@@ -319,20 +337,40 @@ export class Account2FA extends AccountMultisig {
                 error;
         });
         const currentAccountStateKeys = currentAccountState.map(({ key }) => key.toString('base64'))
-        const cleanupActions = currentAccountState.length ? [
+        return currentAccountState.length ? [
             deployContract(cleanupContractBytes),
             functionCall('clean', { keys: currentAccountStateKeys }, MULTISIG_GAS, new BN('0'))
         ] : [];
-        const actions = [
-            ...cleanupActions,
+    }
+
+    async get2faDisableKeyConversionActions() {
+        const { accountId } = this;
+        const accessKeys = await this.getAccessKeys();
+        const lak2fak = accessKeys
+            .filter(({ access_key }) => access_key.permission !== 'FullAccess')
+            .filter(({ access_key }) => {
+                const perm = (access_key.permission as FunctionCallPermissionView).FunctionCall;
+                return  perm.receiver_id === accountId &&
+                    perm.method_names.length === 4 &&
+                    perm.method_names.includes('add_request_and_confirm');
+            });
+        const confirmOnlyKey = PublicKey.from((await this.postSignedJson('/2fa/getAccessKey', { accountId })).publicKey);
+        return [
             deleteKey(confirmOnlyKey),
             ...lak2fak.map(({ public_key }) => deleteKey(PublicKey.from(public_key))),
-            ...lak2fak.map(({ public_key }) => addKey(PublicKey.from(public_key), null)),
+            ...lak2fak.map(({ public_key }) => addKey(PublicKey.from(public_key), fullAccessKey()))
+        ];
+    }
+
+    async disable(contractBytes: Uint8Array, cleanupContractBytes: Uint8Array) {
+        const actions = [
+            ...(await this.get2faDisableCleanupActions(cleanupContractBytes)),
+            ...(await this.get2faDisableKeyConversionActions()),
             deployContract(contractBytes),
         ];
-        console.log('disabling 2fa for', accountId);
+        console.log('disabling 2fa for', this.accountId);
         return await this.signAndSendTransaction({
-            receiverId: accountId,
+            receiverId: this.accountId,
             actions
         });
     }
