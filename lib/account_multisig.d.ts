@@ -3,7 +3,6 @@ import { Account, SignAndSendTransactionOptions } from './account';
 import { Connection } from './connection';
 import { Action } from './transaction';
 import { FinalExecutionOutcome } from './providers';
-import { KeyPair } from './utils/key_pair';
 export declare const MULTISIG_STORAGE_KEY = "__multisigRequest";
 export declare const MULTISIG_ALLOWANCE: BN;
 export declare const MULTISIG_GAS: BN;
@@ -62,7 +61,6 @@ export declare class Account2FA extends AccountMultisig {
     private __signAndSendTransaction;
     deployMultisig(contractBytes: Uint8Array): Promise<FinalExecutionOutcome>;
     disableWithFAK({ contractBytes, cleanupContractBytes }: {
-        fullAccessKey: KeyPair;
         contractBytes: Uint8Array;
         cleanupContractBytes?: Uint8Array;
     }): Promise<FinalExecutionOutcome>;
